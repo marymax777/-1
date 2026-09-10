@@ -1,20 +1,20 @@
-"""Business booking assistant 1.2. Python stdlib; all times Europe/Moscow."""
+"""Business booking assistant 1.3. Python stdlib; all times Europe/Moscow."""
 import os, re, json, time, sqlite3, threading, hashlib, hmac, urllib.request, urllib.error
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = '1.2'
+VERSION = '1.3'
 STATUS = {'free':'свободно','blocked':'занято вручную','held':'бронь','booked':'оплачено','review':'проверка поста','payment':'ожидаем оплату','checking':'проверка оплаты','expired':'срок истёк','confirmed':'оплачено','cancelled':'отменено'}
 TZ = ZoneInfo('Europe/Moscow')
 MENU = {'keyboard':[['Расписание','Добавить слоты'],['Заявки','Шаблоны'],['Цены и дополнения'],['Автоответы','Помощь']], 'resize_keyboard':True}
 DEFAULTS = {
- 'welcome':'Здравствуйте! Пришлите, пожалуйста, объявление, которое хотите разместить 🤍 Если пост ещё не готов, можно сначала посмотреть стоимость и свободное время.',
- 'slots':'Свободное время для публикации (Москва). Выберите подходящий слот:',
+ 'welcome':'Здравствуйте! Пришлите, пожалуйста, объявление, которое хотите разместить.',
+ 'slots':'Доступное время для публикации ниже (Москва). Выберите подходящий вариант:',
  'empty':'Сейчас свободное время не указано. Уточню расписание и отвечу вам лично.',
  'held':'Вы выбрали {slot}. Время закрепляется после подтверждения оплаты.',
- 'post':'Объявление получила, спасибо! Сейчас проверю. Если всё в порядке, пришлю реквизиты для оплаты 🤍',
+ 'post':'Объявление получил и передал на проверку.',
  'payment':'', 'pricing':'{catalog}', 'conditions':'Пришлите объявление одним сообщением: текст с фото или альбом до 10 фотографий с текстом в подписи. Укажите услугу, стоимость, дату, адрес, контакт для записи и требования к модели, если они есть. Пост остаётся в канале; удаление — по вашему запросу. Перенос или отмену согласуйте заранее.',
  'approved':'Размещение {slot}. Стоимость: {price} ₽. Слот закрепляется после подтверждения оплаты администратором. После оплаты пришлите чек.',
  'paid_claim':'Спасибо! Проверю поступление оплаты и подтвержу размещение.',
@@ -23,6 +23,7 @@ DEFAULTS = {
 }
 LABELS={'welcome':'Приветствие','slots':'Свободное время','empty':'Нет слотов','held':'Выбор времени','post':'Пост получен','payment':'Реквизиты','pricing':'Прайс','conditions':'Условия','approved':'Счёт','paid_claim':'Проверка оплаты','confirmed':'Оплата подтверждена','cancelled':'Отмена заявки'}
 DEFAULT_TRIGGERS={
+ 'welcome':['здравствуйте','здравствуй','привет','добрый день','добрый вечер','доброе утро','доброго дня','приветствую'],
  'slots':['ближайший слот','свободные слоты','свободное время','ближайшее время','какое время','когда можно','позже','другой день','другое время','завтра'],
  'pricing':['сколько стоит','стоимость размещения','цена размещения','прайс','расценки'],
  'conditions':['как разместить','как разместиться','условия размещения','хочу разместить','хочу разместиться'],
@@ -34,7 +35,7 @@ def buttons(rows): return {'inline_keyboard':[[{'text':label,'callback_data':val
 def norm(t): return ' '.join(re.findall(r'[\w]+',t.lower().replace('ё','е')))
 
 def api(token,method,payload):
-    req=urllib.request.Request('https://api.telegram.org/bot'+token+'/'+method,json.dumps(payload).encode(),{'Content-Type':'application/json','User-Agent':'BusinessBookingBot/1.2'})
+    req=urllib.request.Request('https://api.telegram.org/bot'+token+'/'+method,json.dumps(payload).encode(),{'Content-Type':'application/json','User-Agent':'BusinessBookingBot/1.3'})
     try:
         with urllib.request.urlopen(req,timeout=30) as r: result=json.load(r)
     except urllib.error.HTTPError as e:
@@ -95,6 +96,20 @@ class App:
             # Do not replay a send whose response may have been lost on a restart.
             self.db.execute("UPDATE outbox SET status='uncertain' WHERE status='sending'")
         self.migrate_orders(path)
+        with self.db:
+            triggers=json.loads(self.setting('triggers'))
+            if 'welcome' not in triggers:
+                triggers['welcome']=DEFAULT_TRIGGERS['welcome'];self.set('triggers',json.dumps(triggers,ensure_ascii=False))
+            if not self.db.execute("SELECT 1 FROM settings WHERE k='flow_1.3'").fetchone():
+                # Preserve custom templates; replace only the shipped factory wording.
+                old={'welcome':'Здравствуйте! Пришлите, пожалуйста, объявление, которое хотите разместить 🤍 Если пост ещё не готов, можно сначала посмотреть стоимость и свободное время.',
+                     'slots':'Свободное время для публикации (Москва). Выберите подходящий слот:',
+                     'post':'Объявление получила, спасибо! Сейчас проверю. Если всё в порядке, пришлю реквизиты для оплаты 🤍'}
+                for key,value in old.items():
+                    row=json.loads(self.db.execute('SELECT payload FROM templates WHERE k=?',(key,)).fetchone()[0])
+                    if row.get('text')==value and not row.get('file_id') and not row.get('entities'):
+                        self.db.execute('UPDATE templates SET payload=? WHERE k=?',(json.dumps({'text':DEFAULTS[key]},ensure_ascii=False),key))
+                self.set('flow_1.3','1')
     def migrate_orders(self,path):
         if self.setting('schema_version')=='1.2':return
         if self.db.execute('SELECT 1 FROM bookings LIMIT 1').fetchone() or self.db.execute("SELECT 1 FROM templates WHERE k='payment' AND payload!=?",(json.dumps({'text':''},ensure_ascii=False),)).fetchone():
@@ -126,6 +141,15 @@ class App:
     def setting(self,k): return self.db.execute('SELECT v FROM settings WHERE k=?',(k,)).fetchone()[0]
     def set(self,k,v): self.db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',(k,str(v)))
     def enqueue(self,method,payload,scope=''):
+        ui=getattr(self,'ui_message',None)
+        if ui and scope and payload.get('chat_id')==ui['chat']['id'] and scope==ui.get('business_connection_id') and method in ('sendMessage','sendPhoto','sendDocument'):
+            self.ui_message=None
+            if method=='sendMessage' and ui.get('text'):
+                method='editMessageText';payload={**payload,'message_id':ui['message_id']}
+                payload.setdefault('reply_markup',buttons([]))
+            else:
+                # Media templates cannot replace a text message; retire its keyboard.
+                self.enqueue('editMessageReplyMarkup',{'business_connection_id':scope,'chat_id':payload['chat_id'],'message_id':ui['message_id'],'reply_markup':buttons([])},scope)
         self.db.execute('INSERT INTO outbox(method,payload,scope,automatic) VALUES(?,?,?,?)',(method,json.dumps(payload,ensure_ascii=False),scope,int(self.automatic and bool(scope))))
     def send(self,text,chat=None,conn='',markup=None):
         text=text.encode('utf-16-le')[:7600].decode('utf-16-le',errors='ignore')
@@ -211,7 +235,7 @@ class App:
         self.db.execute('UPDATE bookings SET slot=?,revision=revision+1 WHERE id=?',(slot,b['id']))
         b=self.booking(b['id'])
         markup=self.next_buttons(b)
-        self.template('held',chat,conn,slot=stamp(row['at']),markup=markup)
+        self.template('held',chat,conn,slot=stamp(row['at']),markup=markup,append=self.missing_steps(b)+('\n\nПришлите, пожалуйста, объявление для проверки.' if not b['post_received'] else ('\n\nПосле проверки объявления пришлю реквизиты.' if b['cart_ready'] else '')))
         self.notify(b)
     def cancel(self,b):
         if b['status']=='cancelled':return
@@ -384,9 +408,16 @@ class App:
         return buttons([[('Стоимость и дополнения','c:pricing:0')],[('Свободное время','c:page:0'),('Условия','c:conditions:0')]])
     def next_buttons(self,b):
         if b['status'] in ('payment','checking'):return buttons([[('Я оплатил(а)',f'c:paid:{b["id"]}')]])
-        if not b['cart_ready']:return buttons([[('Выбрать дополнения',f'c:cart:{b["id"]}')]])
-        if not b['slot']:return buttons([[('Выбрать время','c:page:0')]])
-        return buttons([[('Изменить дополнения',f'c:cart:{b["id"]}')],[('Изменить время','c:page:0')]])
+        rows=[]
+        if not b['cart_ready']:rows.append([('Стоимость',f'c:cart:{b["id"]}')])
+        if not b['slot']:rows.append([('Свободное время','c:page:0')])
+        return buttons(rows)
+    def missing_steps(self,b):
+        if b['status']!='review':return ''
+        if not b['cart_ready'] and not b['slot']:return '\n\nВыберите стоимость размещения и свободное время кнопками ниже.'
+        if not b['cart_ready']:return '\n\nВыберите стоимость размещения кнопкой ниже.'
+        if not b['slot']:return '\n\nВыберите свободное время кнопкой ниже.'
+        return ''
     def show_pricing(self,conn,chat,prefix=''):
         # A legacy free-text price list remains editable but cannot override catalog prices.
         p=json.loads(self.db.execute("SELECT payload FROM templates WHERE k='pricing'").fetchone()[0])
@@ -426,6 +457,12 @@ class App:
             self.template('paid_claim',b['chat'],b['conn'])
             self.send('Мастер сообщил об оплате или прислал возможный чек. Проверь поступление денег.');self.notify(self.booking(b['id']))
     def client_callback(self,act,val,conn,chat,name,message):
+        # Replace only the bot's interactive message selected by this customer.
+        # Payment details and customer posts are never targets of this flow.
+        self.ui_message=message if act!='paid' and message and message.get('message_id') else None
+        try:self.client_step(act,val,conn,chat,name,message)
+        finally:self.ui_message=None
+    def client_step(self,act,val,conn,chat,name,message):
         if act=='page':self.list_slots(chat,conn,int(val));return
         if act=='slot':self.reserve(int(val),conn,chat,name);return
         if act=='pricing':self.show_pricing(conn,chat);return
@@ -487,7 +524,15 @@ class App:
         else:kind='receipt' if b and b['status'] in ('payment','checking') else 'post'
         triggers=json.loads(self.setting('triggers'))
         kinds=[k for k,phrases in triggers.items() if any((' '+norm(p)+' ') in (' '+n+' ') for p in phrases)]
-        paid= 'paid_claim' in kinds or n in ('оплачено','готово с оплатой','оплата готово')
+        paid= 'paid_claim' in kinds or bool(re.search(r'\b(оплачено|готово с оплатой)\b',n))
+        greeting=('welcome' in kinds or bool(re.match(r'^(здравствуйте|здравствуй|добрый день|добрый вечер|доброе утро|привет)(\s|$)',n)))
+        conversational=not media and not m.get('forward_origin') and len(text)<240 and '\n' not in text and not re.search(r'\b(ищу моделей|ищем моделей|требуются модели|нужны модели)\b',n)
+        if conversational and (greeting or (not b and ('conditions' in kinds or len(text)<120))) and not paid:
+            b=b or self.ensure_order(conn,chat,m.get('from',{}).get('first_name','Мастер'))
+            if b['post_received'] or b['status'] in ('payment','checking'):
+                self.send('Здравствуйте!'+self.missing_steps(b) if self.missing_steps(b) else 'Здравствуйте! Ваша заявка уже получена. Если есть вопрос, напишите его здесь.',chat,conn,self.next_buttons(b))
+            else:self.template('welcome',chat,conn,markup=self.menu_buttons() if not b['cart_ready'] and not b['slot'] else self.next_buttons(b))
+            return
         if b and b['status'] in ('payment','checking') and (media or paid) and kind=='receipt':
             if gid:self.db.execute('INSERT INTO message_groups VALUES(?,?,?,?,?) ON CONFLICT(conn,gid) DO UPDATE SET last_at=excluded.last_at',(conn,gid,b['id'],'receipt',self.clock()))
             if mid is not None:self.db.execute('INSERT OR IGNORE INTO received_messages VALUES(?,?,?)',(conn,mid,b['id']))
@@ -506,17 +551,9 @@ class App:
             self.forward_to_owner(b,m,'post')
             if not b['post_received']:
                 self.db.execute('UPDATE bookings SET post_received=1,revision=revision+1 WHERE id=?',(b['id'],))
-                b=self.booking(b['id']);self.template('post',chat,conn,markup=self.next_buttons(b));self.notify(b)
+                b=self.booking(b['id']);self.template('post',chat,conn,markup=self.next_buttons(b),append=self.missing_steps(b));self.notify(b)
             return
-        greeted=bool(re.match(r'^(здравствуйте|добрый день|добрый вечер|доброе утро|привет)(\s|$)',n))
-        last=self.db.execute("SELECT at FROM cooldown WHERE conn=? AND chat=? AND kind='hello'",(conn,chat)).fetchone()
-        new_hello=greeted and (not last or self.clock()-last[0]>86400)
-        if new_hello:
-            self.db.execute("INSERT OR REPLACE INTO cooldown VALUES(?,?,'hello',?)",(conn,chat,self.clock()))
-        if 'pricing' in kinds:self.show_pricing(conn,chat,'Здравствуйте!\n\n' if new_hello else '');return
-        if new_hello:
-            self.ensure_order(conn,chat,m.get('from',{}).get('first_name','Мастер'))
-            self.template('welcome',chat,conn,markup=self.menu_buttons());return
+        if 'pricing' in kinds:self.show_pricing(conn,chat);return
         if 'slots' in kinds:self.list_slots(chat,conn);return
         if 'conditions' in kinds:self.template('conditions',chat,conn,markup=self.menu_buttons());return
         if b:
